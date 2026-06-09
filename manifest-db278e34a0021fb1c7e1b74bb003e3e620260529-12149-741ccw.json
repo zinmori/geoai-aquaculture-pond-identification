@@ -1,0 +1,40 @@
+{
+  "description": "This is a system generated manifest of files expected to be present in this zip. It can be safely deleted.",
+  "metadata": {
+    "generated_at": "2026-05-29T11:04:06+00:00",
+    "trigger": {
+      "file_hashid": "unknown",
+      "action": "unknown"
+    }
+  },
+  "manifest": [
+    {
+      "filename": "SampleSubmission.csv",
+      "filesize": 14609,
+      "description": "Shows the structure of the sample submission file",
+      "created_at": "2026-05-29 11:01:28 UTC",
+      "updated_at": "2026-05-29 11:01:33 UTC"
+    },
+    {
+      "filename": "Train.csv",
+      "filesize": 914083,
+      "description": "Labelled satellite observations for 963 locations used to train the model.",
+      "created_at": "2026-05-29 11:01:37 UTC",
+      "updated_at": "2026-05-29 11:03:34 UTC"
+    },
+    {
+      "filename": "Trustworthiness_Evaluation.pdf",
+      "filesize": 139715,
+      "description": "AI Trustworthiness Evaluation document",
+      "created_at": "2026-05-27 11:34:47 UTC",
+      "updated_at": "2026-05-27 11:35:03 UTC"
+    },
+    {
+      "filename": "Test.csv",
+      "filesize": 812803,
+      "description": "Unlabelled satellite observations for 858 locations used to evaluate the model.",
+      "created_at": "2026-05-29 11:03:45 UTC",
+      "updated_at": "2026-05-29 11:04:06 UTC"
+    }
+  ]
+}
