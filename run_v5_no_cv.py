@@ -1,23 +1,19 @@
 """
-Operation Premiere Place v4 — Enhanced Features + Tuned Hyperparameters
+Operation Premiere Place v5 — No CV Pipeline (~5x speedup over run_v5_fast)
 =======================================================================
-Based on Claude's v3 (honest calibration, NaN-preserving, Saerens/EM).
-
-Enhancements:
-1. NEW FEATURES: IQR, kurtosis, skewness, CV, lag-1 autocorrelation,
-   RVI (SAR), cross-index interactions, seasonal amplitude, obs density
-2. HYPERPARAMETERS: lr=0.01, n_est=1200, subsample=0.8, colsample=0.8
-3. FINER ENSEMBLE: weight step 0.05 instead of 0.10
-4. MULTI-ROUND PL: R1 at 0.90, R2 at 0.85
-5. FEATURE SELECTION: drop features with near-zero importance
+Based on run_v5_fast, but:
+1. No cross validation is performed. Models are trained directly on all available data.
+2. Estimators/iterations set to 1200, matching run_v5_fast config.
+3. In-sample predictions are used for Platt scaling (Logistic Regression) calibration 
+   and ensemble weights optimization.
+4. Pseudo-labeling is also done without cross validation, training on the combined dataset.
 """
 import pandas as pd
 import numpy as np
 import random
 from scipy import stats as scipy_stats
-from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, f1_score
-from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
 import lightgbm as lgb
 from catboost import CatBoostClassifier
 import xgboost as xgb
@@ -27,6 +23,7 @@ warnings.filterwarnings('ignore')
 RNG_SEED = 42
 SEEDS = [42, 123, 456, 789, 1337]
 BANDS = ['blue', 'green', 'red', 'nir', 'nira', 'swir1', 'swir2', 're1', 're2', 're3', 'VH', 'VV']
+N_ESTIMATORS = 1200
 
 print("Loading data...")
 train = pd.read_csv('Train.csv')
@@ -115,14 +112,14 @@ def extract_features(df):
             series['vh_vv'].append(vh - vv)
             series['nira_ndvi'].append((nira - red) / (nira + red + 1e-8))
             
-            # NEW: Advanced SAR features
-            series['rvi'].append(4 * vh_lin / (vh_lin + vv_lin + 1e-8))  # Radar Vegetation Index
-            series['vh_vv_ratio'].append(vh_lin / (vv_lin + 1e-8))  # Polarization ratio (linear)
+            # SAR features
+            series['rvi'].append(4 * vh_lin / (vh_lin + vv_lin + 1e-8))
+            series['vh_vv_ratio'].append(vh_lin / (vv_lin + 1e-8))
             
-            # NEW: Cross-index interactions
-            series['water_product'].append(mndwi_val * (1 - ndvi_val))  # water=high MNDWI, low NDVI
+            # Cross-index interactions
+            series['water_product'].append(mndwi_val * (1 - ndvi_val))
             awei_val = 4.0 * (green - swir1) - (0.25 * nir + 2.75 * swir2)
-            series['awei_mndwi_diff'].append(awei_val - mndwi_val)  # water type discriminator
+            series['awei_mndwi_diff'].append(awei_val - mndwi_val)
 
         arrs = {k: np.array(v, dtype=float) for k, v in series.items()}
 
@@ -147,17 +144,15 @@ def extract_features(df):
             f[f'{name}_range'] = s[-1] - s[0]
             f[f'{name}_std'] = np.std(valid)
             f[f'{name}_frac_pos'] = np.mean(valid > 0)
-            # NEW: Higher-order statistics
             f[f'{name}_iqr'] = f[f'{name}_p75'] - f[f'{name}_p25']
             f[f'{name}_kurtosis'] = scipy_stats.kurtosis(valid) if len(valid) >= 4 else 0.0
             f[f'{name}_skew'] = scipy_stats.skew(valid) if len(valid) >= 3 else 0.0
             mean_val = np.mean(valid)
-            f[f'{name}_cv'] = np.std(valid) / (abs(mean_val) + 1e-8)  # coefficient of variation
+            f[f'{name}_cv'] = np.std(valid) / (abs(mean_val) + 1e-8)
 
         for name, arr in arrs.items():
             pstats(arr, name)
 
-        # Temporal gradients on consecutive observed months
         for name in ['mndwi', 'ndvi', 'sar', 'ndsi', 'rvi', 'water_product']:
             valid_idx = np.where(~np.isnan(arrs[name]))[0]
             if len(valid_idx) >= 2:
@@ -171,7 +166,7 @@ def extract_features(df):
                 f[f'{name}_grad_std'] = 0.0
                 f[f'{name}_grad_max'] = 0.0
 
-        # NEW: Lag-1 autocorrelation for key indices
+        # Lag-1 autocorrelation
         for name in ['mndwi', 'ndvi', 'sar', 'sdwi']:
             valid_idx = np.where(~np.isnan(arrs[name]))[0]
             if len(valid_idx) >= 4:
@@ -180,8 +175,7 @@ def extract_features(df):
                     autocorr = np.corrcoef(vals[:-1], vals[1:])[0, 1]
                     f[f'{name}_autocorr'] = autocorr if np.isfinite(autocorr) else 0.0
                 else:
-                    f[f'{name}_autocorr'] = 1.0  # constant = perfect autocorr
-                # Mean absolute successive difference
+                    f[f'{name}_autocorr'] = 1.0
                 f[f'{name}_masd'] = np.mean(np.abs(np.diff(vals)))
             else:
                 f[f'{name}_autocorr'] = 0.0
@@ -203,27 +197,24 @@ def extract_features(df):
         f['water_floor'] = f['mndwi_p10'] - f['sar_p10']
         f['water_consist'] = f['mndwi_frac_pos'] * (1 - f['sar_frac_pos'])
 
-        # NEW: Additional cross-correlations
         rvi_valid = arrs['rvi'][~np.isnan(arrs['rvi'])]
         if len(rvi_valid) > 1 and len(mndwi_valid) > 1 and len(rvi_valid) == len(mndwi_valid):
             f['rvi_mndwi_corr'] = np.corrcoef(rvi_valid, mndwi_valid)[0, 1]
         else:
             f['rvi_mndwi_corr'] = 0.0
         
-        # NEW: Water permanence — fraction of months where MNDWI > 0 AND ndvi < 0.3
         if len(mndwi_valid) > 0 and len(ndvi_valid) > 0 and len(mndwi_valid) == len(ndvi_valid):
             f['water_perm'] = np.mean((mndwi_valid > 0) & (ndvi_valid < 0.3))
         else:
             f['water_perm'] = 0.0
 
-        # Missingness metadata (from Claude's v3)
+        # Missingness metadata
         n_obs = len(observed_months)
         f['n_months_observed'] = n_obs
         f['first_observed_month'] = observed_months[0] if n_obs else 0
         f['last_observed_month'] = observed_months[-1] if n_obs else 0
         f['block_length'] = (observed_months[-1] - observed_months[0] + 1) if n_obs else 0
         f['obs_month_mid'] = np.mean(observed_months) if n_obs else 0.0
-        # NEW: Observation density
         f['obs_density'] = n_obs / (f['block_length'] + 1e-8) if f['block_length'] > 0 else 0.0
 
         feats.append(f)
@@ -250,14 +241,14 @@ def saerens_prior_correction(p_test, train_prior, max_iter=100, tol=1e-6):
     return p_final, prior_new
 
 # ===================================================================
-# 4. Training loop — honest calibration, tuned hyperparameters
+# 4. Training loop — No CV, direct training on all data
 # ===================================================================
 y_train_base = train['label'].values
 n_test = len(test)
 test_nan = test.replace(-9999, np.nan)
 
 all_test_preds_base = []
-all_oof_final = []
+all_train_final = []
 cached_data = {}
 
 for seed_idx, seed in enumerate(SEEDS):
@@ -268,7 +259,7 @@ for seed_idx, seed in enumerate(SEEDS):
     X_test = extract_features(test_nan)
     feature_cols = list(X_train.columns)
     
-    # Replace inf/nan in features
+    # Clean features
     X_train = X_train.replace([np.inf, -np.inf], np.nan).fillna(0)
     X_test = X_test.replace([np.inf, -np.inf], np.nan).fillna(0)
     
@@ -276,46 +267,46 @@ for seed_idx, seed in enumerate(SEEDS):
         print(f"  Feature count: {len(feature_cols)}")
     cached_data[seed] = (X_train, X_test, feature_cols)
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RNG_SEED)
-    oof_lgb = np.zeros(len(y_train_base))
-    oof_cb = np.zeros(len(y_train_base))
-    oof_xgb = np.zeros(len(y_train_base))
-    test_preds_lgb, test_preds_cb, test_preds_xgb = [], [], []
+    # LightGBM
+    base_lgb = lgb.LGBMClassifier(
+        random_state=seed, n_estimators=N_ESTIMATORS, learning_rate=0.01,
+        max_depth=6, scale_pos_weight=1.5, verbose=-1, min_child_samples=15,
+        subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0)
+    base_lgb.fit(X_train, y_train_base)
+    train_lgb_raw = base_lgb.predict_proba(X_train)[:, 1]
+    test_lgb_raw = base_lgb.predict_proba(X_test[feature_cols])[:, 1]
 
-    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_train, y_train_base)):
-        X_tr, y_tr = X_train.iloc[tr_idx], y_train_base[tr_idx]
-        X_val, y_val = X_train.iloc[val_idx], y_train_base[val_idx]
+    # CatBoost
+    base_cb = CatBoostClassifier(
+        random_seed=seed, iterations=N_ESTIMATORS, learning_rate=0.01,
+        depth=6, auto_class_weights='Balanced', thread_count=-1, verbose=0,
+        l2_leaf_reg=5, bagging_temperature=0.5, subsample=0.8)
+    base_cb.fit(X_train, y_train_base, verbose=False)
+    train_cb_raw = base_cb.predict_proba(X_train)[:, 1]
+    test_cb_raw = base_cb.predict_proba(X_test[feature_cols])[:, 1]
 
-        # LightGBM — tuned hyperparameters
-        base_lgb = lgb.LGBMClassifier(
-            random_state=seed + fold, n_estimators=1200, learning_rate=0.01,
-            max_depth=6, scale_pos_weight=1.5, verbose=-1, min_child_samples=15,
-            subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0)
-        cal_lgb = CalibratedClassifierCV(base_lgb, method='sigmoid', cv=3)
-        cal_lgb.fit(X_tr, y_tr)
-        oof_lgb[val_idx] = cal_lgb.predict_proba(X_val)[:, 1]
-        test_preds_lgb.append(cal_lgb.predict_proba(X_test[feature_cols])[:, 1])
+    # XGBoost
+    base_xgb = xgb.XGBClassifier(
+        random_state=seed, n_estimators=N_ESTIMATORS, learning_rate=0.01,
+        max_depth=6, scale_pos_weight=1.5, n_jobs=-1, eval_metric='logloss',
+        subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
+        min_child_weight=5)
+    base_xgb.fit(X_train, y_train_base, verbose=False)
+    train_xgb_raw = base_xgb.predict_proba(X_train)[:, 1]
+    test_xgb_raw = base_xgb.predict_proba(X_test[feature_cols])[:, 1]
 
-        # CatBoost — tuned
-        base_cb = CatBoostClassifier(
-            random_seed=seed + fold, iterations=1200, learning_rate=0.01,
-            depth=6, auto_class_weights='Balanced', thread_count=-1, verbose=0,
-            l2_leaf_reg=5, bagging_temperature=0.5, subsample=0.8)
-        cal_cb = CalibratedClassifierCV(base_cb, method='sigmoid', cv=3)
-        cal_cb.fit(X_tr, y_tr)
-        oof_cb[val_idx] = cal_cb.predict_proba(X_val)[:, 1]
-        test_preds_cb.append(cal_cb.predict_proba(X_test[feature_cols])[:, 1])
-
-        # XGBoost — tuned
-        base_xgb = xgb.XGBClassifier(
-            random_state=seed + fold, n_estimators=1200, learning_rate=0.01,
-            max_depth=6, scale_pos_weight=1.5, n_jobs=-1, eval_metric='logloss',
-            subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
-            min_child_weight=5)
-        cal_xgb = CalibratedClassifierCV(base_xgb, method='sigmoid', cv=3)
-        cal_xgb.fit(X_tr, y_tr)
-        oof_xgb[val_idx] = cal_xgb.predict_proba(X_val)[:, 1]
-        test_preds_xgb.append(cal_xgb.predict_proba(X_test[feature_cols])[:, 1])
+    # Fit Platt Scaling Calibrators on complete raw train predictions
+    cal_lgb = LogisticRegression(C=1e5).fit(train_lgb_raw.reshape(-1, 1), y_train_base)
+    cal_cb  = LogisticRegression(C=1e5).fit(train_cb_raw.reshape(-1, 1), y_train_base)
+    cal_xgb = LogisticRegression(C=1e5).fit(train_xgb_raw.reshape(-1, 1), y_train_base)
+    
+    train_lgb = cal_lgb.predict_proba(train_lgb_raw.reshape(-1, 1))[:, 1]
+    train_cb  = cal_cb.predict_proba(train_cb_raw.reshape(-1, 1))[:, 1]
+    train_xgb = cal_xgb.predict_proba(train_xgb_raw.reshape(-1, 1))[:, 1]
+    
+    test_lgb = cal_lgb.predict_proba(test_lgb_raw.reshape(-1, 1))[:, 1]
+    test_cb  = cal_cb.predict_proba(test_cb_raw.reshape(-1, 1))[:, 1]
+    test_xgb = cal_xgb.predict_proba(test_xgb_raw.reshape(-1, 1))[:, 1]
 
     # Finer blend weights (step 0.05)
     best_score, best_weights = 0, (1/3, 1/3, 1/3)
@@ -325,25 +316,23 @@ for seed_idx, seed in enumerate(SEEDS):
             if w3 < -0.001:
                 continue
             w3 = max(w3, 0)
-            oof_ens = w1 * oof_lgb + w2 * oof_cb + w3 * oof_xgb
-            s = 0.6 * f1_score(y_train_base, oof_ens >= 0.5) + 0.4 * roc_auc_score(y_train_base, oof_ens)
+            train_ens = w1 * train_lgb + w2 * train_cb + w3 * train_xgb
+            s = 0.6 * f1_score(y_train_base, train_ens >= 0.5) + 0.4 * roc_auc_score(y_train_base, train_ens)
             if s > best_score:
                 best_score, best_weights = s, (w1, w2, w3)
 
     w1, w2, w3 = best_weights
-    oof_final = w1 * oof_lgb + w2 * oof_cb + w3 * oof_xgb
-    all_oof_final.append(oof_final)
-    print(f"  Weights: LGBM={w1:.2f}, CB={w2:.2f}, XGB={w3:.2f} | Honest CV={best_score:.5f}")
+    train_final = w1 * train_lgb + w2 * train_cb + w3 * train_xgb
+    all_train_final.append(train_final)
+    print(f"  Weights: LGBM={w1:.2f}, CB={w2:.2f}, XGB={w3:.2f} | In-sample Train Score={best_score:.5f}")
 
-    p_test = (w1 * np.mean(test_preds_lgb, axis=0) +
-              w2 * np.mean(test_preds_cb, axis=0) +
-              w3 * np.mean(test_preds_xgb, axis=0))
+    p_test = w1 * test_lgb + w2 * test_cb + w3 * test_xgb
     all_test_preds_base.append(p_test)
 
 p_test_avg = np.mean(all_test_preds_base, axis=0)
-oof_avg = np.mean(all_oof_final, axis=0)
-honest_cv = 0.6 * f1_score(y_train_base, oof_avg >= 0.5) + 0.4 * roc_auc_score(y_train_base, oof_avg)
-print(f"\n{'='*60}\n  HONEST CV (averaged across seeds): {honest_cv:.5f}\n{'='*60}")
+train_avg = np.mean(all_train_final, axis=0)
+train_score = 0.6 * f1_score(y_train_base, train_avg >= 0.5) + 0.4 * roc_auc_score(y_train_base, train_avg)
+print(f"\n{'='*60}\n  TRAIN SCORE (averaged across seeds): {train_score:.5f}\n{'='*60}")
 
 # ===================================================================
 # 5. Prior-shift correction — base model
@@ -355,11 +344,11 @@ print(f"Positives @0.5 after correction:  {(p_test_corrected >= 0.5).sum()} / {n
 
 sub_f1 = (p_test_corrected >= 0.5).astype(int)
 sub_base = pd.DataFrame({'ID': test['ID'], 'TargetF1': sub_f1, 'TargetRAUC': p_test_corrected})
-sub_base.to_csv('submission_base_v4.csv', index=False)
-print(f"Saved submission_base_v4.csv with {sub_f1.sum()} positives.")
+sub_base.to_csv('submission_base_v5_no_cv.csv', index=False)
+print(f"Saved submission_base_v5_no_cv.csv with {sub_f1.sum()} positives.")
 
 # ===================================================================
-# 6. PSEUDO-LABELING Round 1 (threshold 0.90)
+# 6. PSEUDO-LABELING Rounds
 # ===================================================================
 def run_pseudo_labeling(p_ref, cached_data, threshold_pos, threshold_neg, round_name):
     print(f"\n{'='*60}\n  PSEUDO-LABELING {round_name} (pos>={threshold_pos}, neg<={threshold_neg})\n{'='*60}")
@@ -374,42 +363,49 @@ def run_pseudo_labeling(p_ref, cached_data, threshold_pos, threshold_neg, round_
         X_pseudo = pd.concat([X_test[feature_cols][m_pos], X_test[feature_cols][m_neg]], ignore_index=True)
         y_pseudo = np.concatenate([np.ones(m_pos.sum()), np.zeros(m_neg.sum())])
 
-        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RNG_SEED)
-        oof_lgb = np.zeros(len(y_train_base)); oof_cb = np.zeros(len(y_train_base)); oof_xgb = np.zeros(len(y_train_base))
-        test_preds_lgb, test_preds_cb, test_preds_xgb = [], [], []
+        X_tr = pd.concat([X_train, X_pseudo], ignore_index=True)
+        y_tr = np.concatenate([y_train_base, y_pseudo])
 
-        for fold, (tr_idx, val_idx) in enumerate(skf.split(X_train, y_train_base)):
-            X_tr = pd.concat([X_train.iloc[tr_idx], X_pseudo], ignore_index=True)
-            y_tr = np.concatenate([y_train_base[tr_idx], y_pseudo])
-            X_val, y_val = X_train.iloc[val_idx], y_train_base[val_idx]
+        # LightGBM
+        base_lgb = lgb.LGBMClassifier(
+            random_state=seed, n_estimators=N_ESTIMATORS, learning_rate=0.01,
+            max_depth=6, scale_pos_weight=1.5, verbose=-1, min_child_samples=15,
+            subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0)
+        base_lgb.fit(X_tr, y_tr)
+        train_lgb_raw = base_lgb.predict_proba(X_train)[:, 1]
+        test_lgb_raw = base_lgb.predict_proba(X_test[feature_cols])[:, 1]
 
-            base_lgb = lgb.LGBMClassifier(
-                random_state=seed + fold, n_estimators=1200, learning_rate=0.01,
-                max_depth=6, scale_pos_weight=1.5, verbose=-1, min_child_samples=15,
-                subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0)
-            cal_lgb = CalibratedClassifierCV(base_lgb, method='sigmoid', cv=3)
-            cal_lgb.fit(X_tr, y_tr)
-            oof_lgb[val_idx] = cal_lgb.predict_proba(X_val)[:, 1]
-            test_preds_lgb.append(cal_lgb.predict_proba(X_test[feature_cols])[:, 1])
+        # CatBoost
+        base_cb = CatBoostClassifier(
+            random_seed=seed, iterations=N_ESTIMATORS, learning_rate=0.01,
+            depth=6, auto_class_weights='Balanced', thread_count=-1, verbose=0,
+            l2_leaf_reg=5, bagging_temperature=0.5, subsample=0.8)
+        base_cb.fit(X_tr, y_tr, verbose=False)
+        train_cb_raw = base_cb.predict_proba(X_train)[:, 1]
+        test_cb_raw = base_cb.predict_proba(X_test[feature_cols])[:, 1]
 
-            base_cb = CatBoostClassifier(
-                random_seed=seed + fold, iterations=1200, learning_rate=0.01,
-                depth=6, auto_class_weights='Balanced', thread_count=-1, verbose=0,
-                l2_leaf_reg=5, bagging_temperature=0.5, subsample=0.8)
-            cal_cb = CalibratedClassifierCV(base_cb, method='sigmoid', cv=3)
-            cal_cb.fit(X_tr, y_tr)
-            oof_cb[val_idx] = cal_cb.predict_proba(X_val)[:, 1]
-            test_preds_cb.append(cal_cb.predict_proba(X_test[feature_cols])[:, 1])
+        # XGBoost
+        base_xgb = xgb.XGBClassifier(
+            random_state=seed, n_estimators=N_ESTIMATORS, learning_rate=0.01,
+            max_depth=6, scale_pos_weight=1.5, n_jobs=-1, eval_metric='logloss',
+            subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
+            min_child_weight=5)
+        base_xgb.fit(X_tr, y_tr, verbose=False)
+        train_xgb_raw = base_xgb.predict_proba(X_train)[:, 1]
+        test_xgb_raw = base_xgb.predict_proba(X_test[feature_cols])[:, 1]
 
-            base_xgb = xgb.XGBClassifier(
-                random_state=seed + fold, n_estimators=1200, learning_rate=0.01,
-                max_depth=6, scale_pos_weight=1.5, n_jobs=-1, eval_metric='logloss',
-                subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
-                min_child_weight=5)
-            cal_xgb = CalibratedClassifierCV(base_xgb, method='sigmoid', cv=3)
-            cal_xgb.fit(X_tr, y_tr)
-            oof_xgb[val_idx] = cal_xgb.predict_proba(X_val)[:, 1]
-            test_preds_xgb.append(cal_xgb.predict_proba(X_test[feature_cols])[:, 1])
+        # Platt Scaling
+        cal_lgb = LogisticRegression(C=1e5).fit(train_lgb_raw.reshape(-1, 1), y_train_base)
+        cal_cb  = LogisticRegression(C=1e5).fit(train_cb_raw.reshape(-1, 1), y_train_base)
+        cal_xgb = LogisticRegression(C=1e5).fit(train_xgb_raw.reshape(-1, 1), y_train_base)
+        
+        train_lgb = cal_lgb.predict_proba(train_lgb_raw.reshape(-1, 1))[:, 1]
+        train_cb  = cal_cb.predict_proba(train_cb_raw.reshape(-1, 1))[:, 1]
+        train_xgb = cal_xgb.predict_proba(train_xgb_raw.reshape(-1, 1))[:, 1]
+        
+        test_lgb = cal_lgb.predict_proba(test_lgb_raw.reshape(-1, 1))[:, 1]
+        test_cb  = cal_cb.predict_proba(test_cb_raw.reshape(-1, 1))[:, 1]
+        test_xgb = cal_xgb.predict_proba(test_xgb_raw.reshape(-1, 1))[:, 1]
 
         best_score, best_weights = 0, (1/3, 1/3, 1/3)
         for w1 in np.arange(0, 1.01, 0.05):
@@ -417,15 +413,13 @@ def run_pseudo_labeling(p_ref, cached_data, threshold_pos, threshold_neg, round_
                 w3 = 1 - w1 - w2
                 if w3 < -0.001: continue
                 w3 = max(w3, 0)
-                oof_ens = w1 * oof_lgb + w2 * oof_cb + w3 * oof_xgb
-                s = 0.6 * f1_score(y_train_base, oof_ens >= 0.5) + 0.4 * roc_auc_score(y_train_base, oof_ens)
+                train_ens = w1 * train_lgb + w2 * train_cb + w3 * train_xgb
+                s = 0.6 * f1_score(y_train_base, train_ens >= 0.5) + 0.4 * roc_auc_score(y_train_base, train_ens)
                 if s > best_score:
                     best_score, best_weights = s, (w1, w2, w3)
         w1, w2, w3 = best_weights
-        print(f"  PL Weights: LGBM={w1:.2f}, CB={w2:.2f}, XGB={w3:.2f} | Honest CV={best_score:.5f}")
-        p_test = (w1 * np.mean(test_preds_lgb, axis=0) +
-                  w2 * np.mean(test_preds_cb, axis=0) +
-                  w3 * np.mean(test_preds_xgb, axis=0))
+        print(f"  PL Weights: LGBM={w1:.2f}, CB={w2:.2f}, XGB={w3:.2f} | In-sample Train Score={best_score:.5f}")
+        p_test = w1 * test_lgb + w2 * test_cb + w3 * test_xgb
         all_test_preds_pl.append(p_test)
 
     p_test_pl = np.mean(all_test_preds_pl, axis=0)
@@ -433,25 +427,33 @@ def run_pseudo_labeling(p_ref, cached_data, threshold_pos, threshold_neg, round_
     print(f"\nEstimated test prior after {round_name}: {prior_pl:.4f}")
     return p_test_pl_corrected
 
-# Round 1: strict threshold
+# Round 1
 p_r1 = run_pseudo_labeling(p_test_corrected, cached_data, 0.90, 0.10, "Round 1")
 sub_r1_f1 = (p_r1 >= 0.5).astype(int)
 sub_r1 = pd.DataFrame({'ID': test['ID'], 'TargetF1': sub_r1_f1, 'TargetRAUC': p_r1})
-sub_r1.to_csv('submission_pl_r1_v4.csv', index=False)
-print(f"Saved submission_pl_r1_v4.csv with {sub_r1_f1.sum()} positives.")
+sub_r1.to_csv('submission_pl_r1_v5_no_cv.csv', index=False)
+print(f"Saved submission_pl_r1_v5_no_cv.csv with {sub_r1_f1.sum()} positives.")
 
-# Round 2: slightly relaxed threshold  
+# Round 2
 p_r2 = run_pseudo_labeling(p_r1, cached_data, 0.85, 0.15, "Round 2")
 sub_r2_f1 = (p_r2 >= 0.5).astype(int)
 sub_r2 = pd.DataFrame({'ID': test['ID'], 'TargetF1': sub_r2_f1, 'TargetRAUC': p_r2})
-sub_r2.to_csv('submission_pl_r2_v4.csv', index=False)
-print(f"Saved submission_pl_r2_v4.csv with {sub_r2_f1.sum()} positives.")
+sub_r2.to_csv('submission_pl_r2_v5_no_cv.csv', index=False)
+print(f"Saved submission_pl_r2_v5_no_cv.csv with {sub_r2_f1.sum()} positives.")
+
+# Round 3
+p_r3 = run_pseudo_labeling(p_r2, cached_data, 0.80, 0.20, "Round 3")
+sub_r3_f1 = (p_r3 >= 0.5).astype(int)
+sub_r3 = pd.DataFrame({'ID': test['ID'], 'TargetF1': sub_r3_f1, 'TargetRAUC': p_r3})
+sub_r3.to_csv('submission_pl_r3_v5_no_cv.csv', index=False)
+print(f"Saved submission_pl_r3_v5_no_cv.csv with {sub_r3_f1.sum()} positives.")
 
 # Summary
 print(f"\n{'='*60}")
-print(f"  OPERATION PREMIERE PLACE COMPLETE!")
+print(f"  OPERATION PREMIERE PLACE (NO CV EDITION) COMPLETE!")
 print(f"{'='*60}")
 print(f"Files generated:")
-print(f"  submission_base_v4.csv      - Base model + Saerens")
-print(f"  submission_pl_r1_v4.csv     - + Pseudo-labeling R1 (0.90)")
-print(f"  submission_pl_r2_v4.csv     - + Pseudo-labeling R2 (0.85)")
+print(f"  submission_base_v5_no_cv.csv      - Base model + Saerens")
+print(f"  submission_pl_r1_v5_no_cv.csv     - + Pseudo-labeling R1 (0.90)")
+print(f"  submission_pl_r2_v5_no_cv.csv     - + Pseudo-labeling R2 (0.85)")
+print(f"  submission_pl_r3_v5_no_cv.csv     - + Pseudo-labeling R3 (0.80)")
