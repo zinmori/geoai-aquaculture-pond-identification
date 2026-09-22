@@ -1,6 +1,6 @@
 # Aquaculture Pond Identification — Solution Documentation
 
-**Final result: 3th place. Private score 0.947, public score 0.942367202.**
+**Final result: 3rd place. Private score 0.947, public score 0.942367202.**
 
 
 ---
@@ -335,7 +335,7 @@ should land near 0.9167.
 
 | | value |
 |---|---|
-| **Private score (721 rows)** | **0.947 — 3th place** |
+| **Private score (721 rows)** | **0.947 — 3rd place** |
 | Public score (~309 rows) | 0.942367202 |
 | Public AUC component | 0.969432 |
 | Public F1 component | 0.924324 |
