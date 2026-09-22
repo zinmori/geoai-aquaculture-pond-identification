@@ -1,6 +1,0 @@
-# Round 3
-p_r3 = run_pseudo_labeling(p_r2, cached_data, 0.80, 0.20, "Round 3")
-sub_r3_f1 = (p_r3 >= 0.5).astype(int)
-sub_r3 = pd.DataFrame({'ID': test['ID'], 'TargetF1': sub_r3_f1, 'TargetRAUC': p_r3})
-sub_r3.to_csv('submission_pl_r3_v5_fast.csv', index=False)
-print(f"Saved submission_pl_r3_v5_fast.csv with {sub_r3_f1.sum()} positives.")
